@@ -4,6 +4,7 @@ go 1.21.1
 
 require (
 	github.com/anchore/syft v1.4.1
+	github.com/spf13/pflag v1.0.5
 	github.com/xlab/treeprint v1.2.0
 	gopkg.in/yaml.v2 v2.4.0
 )

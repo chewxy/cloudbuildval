@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,46 +62,83 @@ type State struct {
 	cwd  *pathtree
 
 	containers map[string]*sbom.SBOM
+
+	replacements map[string]string
 }
 
-func NewState() *State {
+func NewState(replacements map[string]string) *State {
 	root := newPathtree("root", nil)
 	newPathtree("workspace", root)
 	return &State{
 		root: root,
 		cwd:  root,
 
-		containers: make(map[string]*sbom.SBOM),
+		containers:   make(map[string]*sbom.SBOM),
+		replacements: replacements,
 	}
 }
 
 // ensureSteps ensures that all the images are pulled to local machine. TODO: only pull metadata. We only need entrypoint, cmd, and the sbom.
 func (ai *State) ensureSteps(steps []Step) error {
-	for i, step := range steps {
+
+	for i := range steps {
+		step := &steps[i]
+		// string replacements need to happen first
+		ai.stringReplacement(&steps[i])
+
 		if ai.containers[step.Name] != nil {
 			continue
 		}
+		log.Printf("Pulling %v", step.Name)
 		cmd := exec.Command("docker", "pull", step.Name)
 		err := cmd.Run()
 		if err != nil {
 			return errors.Join(fmt.Errorf("Unable to ensure %v", step.Name), err, cmd.Err)
 		}
 
+		log.Printf("Inspecting %v", step.Name)
 		// now that we have pulled the image, we can inspect it
 		if err = ai.inspectImage(&steps[i]); err != nil {
 			return err
 		}
+
+		log.Printf("Compiling SBOM for %v", step.Name)
 
 		// compile the SBOM
 		if err = ai.compileSBOM(step); err != nil {
 			return err
 		}
 
-		// check that the entrypoint is found in the SBOM
-
+	}
+	// check paths
+	for _, step := range steps {
+		if step.Dir != "" {
+			ai.setDir(step)
+		}
+	}
+	for _, step := range steps {
+		ai.checkEntrypoint(step)
 	}
 
 	return nil
+}
+
+func (ai *State) stringReplacement(step *Step) {
+	log.Printf("Replacing %v with %v", step.Name, ai.replaceStr(step.Name))
+	step.Name = ai.replaceStr(step.Name)
+
+	step.Entrypoint = ai.replaceStr(step.Entrypoint)
+	for i, arg := range step.Args {
+		step.Args[i] = ai.replaceStr(arg)
+	}
+	step.Dir = ai.replaceStr(step.Dir)
+}
+
+func (ai *State) replaceStr(s string) string {
+	for k, v := range ai.replacements {
+		s = strings.ReplaceAll(s, k, v)
+	}
+	return s
 }
 
 func (ai *State) inspectImage(step *Step) (err error) {
@@ -119,7 +157,9 @@ func (ai *State) inspectImage(step *Step) (err error) {
 	}
 	// setting value - use the convention `steps[i]` instead of `step`
 	// because sideeffects are cool bro (that was sarcasm)
-	step.cmd = inspection[0].Config.Cmd[0]
+	if len(step.cmd) > 0 {
+		step.cmd = inspection[0].Config.Cmd[0]
+	}
 	if step.Entrypoint == "" {
 		step.Entrypoint = inspection[0].Config.Entrypoint[0]
 	}
@@ -132,7 +172,7 @@ func (ai *State) inspectImage(step *Step) (err error) {
 	return nil
 }
 
-func (ai *State) compileSBOM(step Step) (err error) {
+func (ai *State) compileSBOM(step *Step) (err error) {
 	// now we compile SBOM
 	filename := step.Name + ".json"
 	cmd := exec.Command("docker", "sbom", step.Name, "--format", "syft-json", "-o", filename)
@@ -159,8 +199,42 @@ func (ai *State) checkEntrypoint(step Step) error {
 	return nil
 }
 
+// workspaceDir is a method that takes a raw directory string and spits out a list of directories to traverse through.
+//
+// PLENTY OF SIDE EFFECTS
+func (ai *State) workspaceDir(raw string, setWorkspace bool) []string {
+	dir := strings.Split(raw, "/")
+	idx := 1
+	switch dir[0] {
+	case "":
+		ai.cwd = ai.root
+	case ".":
+	case "..":
+		ai.cwd = ai.cwd.parent
+	default:
+		if setWorkspace {
+			ai.cwd = ai.root.children["workspace"]
+		}
+		idx = 0
+	}
+	dir = dir[idx:]
+	return dir
+}
+
+func (ai *State) setDir(s Step) {
+	if s.Dir == "" {
+		return // cwd it is!
+	}
+	dir := ai.workspaceDir(s.Dir, true)
+	for _, d := range dir {
+		mkdir(ai, d)
+		cd(ai, d)
+	}
+}
+
 func (ai *State) execute(s Step) error {
 	// directory related ones are executed
+	ai.setDir(s)
 	if isShell(s.Entrypoint) {
 		ts := parseShellArgs(s.Args)
 		for _, t := range ts {
@@ -215,22 +289,13 @@ func mkdir(ai *State, args ...string) error {
 		}
 	}
 	p := args[len(args)-1]
-	l := strings.Split(p, "/")
-	idx := 1
-	switch l[0] {
-	case "":
-		ai.cwd = ai.root
-	case ".":
-	case "..":
-		ai.cwd = ai.cwd.parent
-	default:
-		idx = 0
-	}
-	l = l[idx:]
+	l := ai.workspaceDir(p, false)
 
 	for i, x := range l {
 		if i == len(l)-1 {
-
+			if _, ok := ai.cwd.children[x]; ok {
+				return nil
+			}
 			newPathtree(x, ai.cwd)
 			return nil
 		}
